@@ -1,0 +1,152 @@
+{
+  "name": "LinkedIn Agent – Morning Ideas (9 Uhr)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9,
+              "triggerAtMinute": 0,
+              "daysOfTheWeek": [1, 2, 3, 4, 5]
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule – 9 Uhr Mo-Fr",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 5,
+        "filters": {
+          "q": "label:newsletter newer_than:1d"
+        },
+        "options": {
+          "format": "resolved"
+        }
+      },
+      "id": "gmail-newsletter",
+      "name": "Gmail – Newsletter Label",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [460, 300],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "qrJ9kOjKSFsd7XyM",
+          "name": "[autofyn] GMail - milan@autofyn.io"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Alle Gmail-Items zu einem einzigen Item zusammenfassen.\n// Danach läuft der Rest der Kette nur einmal (nicht N-mal).\nconst emails = $input.all().map(e => e.json);\nreturn [{ json: { emails } }];"
+      },
+      "id": "aggregate-gmail",
+      "name": "Gmail Emails aggregieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://openai.com/blog/rss.xml",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "rss-openai",
+      "name": "RSS – OpenAI Blog",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://www.anthropic.com/news",
+        "options": {
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            }
+          ]
+        }
+      },
+      "id": "anthropic-news",
+      "name": "Anthropic News Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Newsletter aus Gmail – alle aggregierten Emails verarbeiten\nconst emails = $('Gmail Emails aggregieren').first().json.emails || [];\nconst emailBlocks = [];\nlet emailSubject = 'Newsletter';\n\nfor (const e of emails) {\n  const subj = e.subject || e.Subject || '';\n  if (emailSubject === 'Newsletter' && subj) emailSubject = subj;\n\n  // resolved format: e.text = plain text, e.html = HTML\n  let body = e.text || '';\n  if (!body && e.html) {\n    body = e.html\n      .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n      .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n      .replace(/<[^>]*>/g, ' ')\n      .replace(/&nbsp;/g, ' ')\n      .replace(/&amp;/g, '&')\n      .replace(/&lt;/g, '<')\n      .replace(/&gt;/g, '>')\n      .replace(/\\s+/g, ' ')\n      .trim();\n  }\n  if (!body) body = e.snippet || '';\n\n  // Bereinigen: Zero-Width-Zeichen, Tracking-URLs, überflüssige Whitespace\n  body = body\n    .replace(/[\\u200B-\\u200D\\uFEFF\\u200C]/g, '')\n    .replace(/https?:\\/\\/\\S{80,}/g, '[link]')\n    .replace(/\\(https?:\\/\\/\\S+\\)/g, '')\n    .replace(/<https?:\\/\\/[^>]+>/g, '')\n    .replace(/[ \\t]{2,}/g, ' ')\n    .replace(/(\\n\\s*){3,}/g, '\\n\\n')\n    .trim();\n\n  // Max 5000 Zeichen pro Newsletter\n  if (body.length > 5000) body = body.substring(0, 5000) + ' [...]';\n  if (body) emailBlocks.push('[' + subj + ']\\n' + body);\n}\n\nconst emailContent = emailBlocks.join('\\n\\n---\\n\\n');\n\n// 2. OpenAI RSS parsen\nfunction parseRSS(xmlStr, maxItems = 6) {\n  if (!xmlStr) return [];\n  const items = [];\n  const itemRegex = /<item>([\\s\\S]*?)<\\/item>/g;\n  let match;\n  while ((match = itemRegex.exec(xmlStr)) !== null && items.length < maxItems) {\n    const item = match[1];\n    const getTag = (tag) => {\n      const m = item.match(new RegExp(`<${tag}[^>]*><!\\\\[CDATA\\\\[([\\\\s\\\\S]*?)\\\\]\\\\]><\\/${tag}>|<${tag}[^>]*>([\\\\s\\\\S]*?)<\\/${tag}>`));\n      return m ? (m[1] || m[2] || '').trim() : '';\n    };\n    const link = getTag('link') || getTag('guid');\n    items.push({\n      title: getTag('title'),\n      link: link,\n      summary: getTag('description').replace(/<[^>]*>/g, '').substring(0, 400)\n    });\n  }\n  return items;\n}\n\nconst openaiXml = $('RSS – OpenAI Blog').first().json.data || '';\nconst rssOpenai = parseRSS(openaiXml);\n\n// 3. Anthropic News Page parsen (HTML – kein RSS vorhanden)\nfunction parseAnthropicNews(html, maxItems = 6) {\n  if (!html) return [];\n  const items = [];\n  const linkRegex = /href=\"(\\/news\\/[a-z0-9-]+)\"[^>]*>([\\s\\S]*?)<\\/a>/gi;\n  let match;\n  const seen = new Set();\n  while ((match = linkRegex.exec(html)) !== null && items.length < maxItems) {\n    const slug = match[1];\n    if (seen.has(slug)) continue;\n    seen.add(slug);\n    const rawText = match[2].replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();\n    if (rawText.length < 15) continue;\n    const cleanTitle = rawText\n      .replace(/^(Announcements|Product|Research|Policy|News)\\s*/i, '')\n      .replace(/\\w{3}\\s+\\d{1,2},?\\s+\\d{4}\\s*/g, '')\n      .substring(0, 80)\n      .trim();\n    if (cleanTitle.length < 10) continue;\n    items.push({\n      title: cleanTitle,\n      link: 'https://www.anthropic.com' + slug,\n      summary: ''\n    });\n  }\n  return items;\n}\n\nconst anthropicHtml = $('Anthropic News Page').first().json.data || '';\nconst rssAnthropic = parseAnthropicNews(anthropicHtml);\n\nconst payload = {\n  email_content: emailContent,\n  email_subject: emailSubject,\n  rss_openai: rssOpenai,\n  rss_anthropic: rssAnthropic\n};\n\nreturn [{ json: { payload } }];"
+      },
+      "id": "prepare-payload",
+      "name": "Payload zusammenbauen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://linkedin-agent:8000/generate-ideas",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "call-agent",
+      "name": "LinkedIn Agent aufrufen",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "Schedule – 9 Uhr Mo-Fr": {
+      "main": [[{ "node": "Gmail – Newsletter Label", "type": "main", "index": 0 }]]
+    },
+    "Gmail – Newsletter Label": {
+      "main": [[{ "node": "Gmail Emails aggregieren", "type": "main", "index": 0 }]]
+    },
+    "Gmail Emails aggregieren": {
+      "main": [[{ "node": "RSS – OpenAI Blog", "type": "main", "index": 0 }]]
+    },
+    "RSS – OpenAI Blog": {
+      "main": [[{ "node": "Anthropic News Page", "type": "main", "index": 0 }]]
+    },
+    "Anthropic News Page": {
+      "main": [[{ "node": "Payload zusammenbauen", "type": "main", "index": 0 }]]
+    },
+    "Payload zusammenbauen": {
+      "main": [[{ "node": "LinkedIn Agent aufrufen", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Berlin"
+  }
+}
