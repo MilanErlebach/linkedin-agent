@@ -4,7 +4,7 @@ LinkedIn Agent - Morning Idea Generator
 Aufgerufen von n8n via HTTP Request.
 
 Zweistufiger Pipeline:
-  Phase 1 (Synthese):  Claude fetcht 15+ RSS-Feeds, filtert auf 48h, dedupliziert Topics
+  Phase 1 (Synthese):  Python fetcht 15+ RSS-Feeds, Claude filtert auf 48h + dedupliziert
   Phase 2 (Ideen):     Claude wählt 10 beste Topics, erstellt Post-Ideen mit autofyn-Winkel
 
 Input JSON:
@@ -14,14 +14,6 @@ Input JSON:
         "rss_openai": [{"title": "...", "link": "...", "summary": "...", "pubDate": "..."}],
         "rss_anthropic": [{"title": "...", "link": "...", "summary": "...", "pubDate": "..."}]
     }
-
-Output (stdout, JSON):
-    {
-        "status": "success",
-        "ideas": [...10 idea objects...],
-        "generated_at": "2026-02-25T09:00:00+01:00",
-        "model": "claude-sonnet-4-6"
-    }
 """
 
 import os
@@ -30,6 +22,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -41,27 +34,26 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from prompts import SYNTHESIS_SYSTEM_PROMPT, IDEA_GENERATION_SYSTEM_PROMPT
-from tools import TOOL_DEFINITIONS, execute_tool
+from tools import TOOL_DEFINITIONS, execute_tool, fetch_rss
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stderr  # logs go to stderr, output goes to stdout
+    stream=sys.stderr
 )
 logger = logging.getLogger("linkedin_agent")
 
 MODEL = "claude-sonnet-4-6"
 
-# Phase 1 – Synthesis constants
-SYNTHESIS_MAX_ITERATIONS = 20
-SYNTHESIS_FORCE_OUTPUT_AFTER = 15  # allow many RSS fetches before forcing output
+# Phase 1 – Synthesis: no tool calls, just 1-2 Claude iterations
+SYNTHESIS_MAX_ITERATIONS = 5
 
 # Phase 2 – Idea generation constants
 IDEAS_MAX_ITERATIONS = 10
 IDEAS_FORCE_OUTPUT_AFTER = 5
 
-# Additional RSS feeds for Claude to fetch in synthesis phase
-RSS_FEEDS_FOR_SYNTHESIS = [
+# RSS feeds to pre-fetch in Python before synthesis
+RSS_FEEDS = [
     ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
     ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
     ("The Verge", "https://www.theverge.com/rss/index.xml"),
@@ -89,8 +81,33 @@ def load_input(arg: str) -> dict:
         return json.loads(arg)
 
 
-def build_synthesis_message(data: dict) -> str:
-    """Build user message for Phase 1: includes pre-fetched sources + list of feeds to fetch."""
+def prefetch_rss_feeds() -> list[dict]:
+    """Fetch all RSS feeds in parallel using Python. Returns list of {name, items}."""
+    results = []
+
+    def _fetch_one(name: str, url: str) -> dict:
+        logger.info(f"Fetching RSS: {name}")
+        raw = fetch_rss(url, max_items=10)
+        data = json.loads(raw)
+        items = data.get("items", [])
+        logger.info(f"  {name}: {len(items)} items")
+        return {"name": name, "items": items}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_fetch_one, name, url): name for name, url in RSS_FEEDS}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as e:
+                logger.warning(f"Failed to fetch {name}: {e}")
+                results.append({"name": name, "items": []})
+
+    return results
+
+
+def build_synthesis_message(data: dict, rss_results: list[dict]) -> str:
+    """Build user message for Phase 1: all sources already fetched, Claude just analyzes."""
     berlin = ZoneInfo("Europe/Berlin")
     now = datetime.now(berlin)
     today = now.strftime("%A, %d. %B %Y, %H:%M Uhr")
@@ -103,34 +120,52 @@ def build_synthesis_message(data: dict) -> str:
     email_content = data.get("email_content", "").strip()
     email_subject = data.get("email_subject", "").strip()
     if email_content:
-        lines.append(f"## Bereits vorhanden – Newsletter: {email_subject or 'Startup Insider Daily'}")
+        lines.append(f"## Newsletter: {email_subject or 'Startup Insider Daily'}")
         lines.append(email_content[:4000])
         lines.append("")
 
     rss_openai = data.get("rss_openai", [])
     if rss_openai:
-        lines.append("## Bereits vorhanden – OpenAI Blog")
+        lines.append("## OpenAI Blog")
         for item in rss_openai[:6]:
             date_str = f" ({item['pubDate']})" if item.get("pubDate") else ""
             lines.append(f"- [{item.get('title', '')}]({item.get('link', '')}){date_str}")
+            if item.get("summary"):
+                lines.append(f"  {item['summary'][:200]}")
         lines.append("")
 
     rss_anthropic = data.get("rss_anthropic", [])
     if rss_anthropic:
-        lines.append("## Bereits vorhanden – Anthropic News")
+        lines.append("## Anthropic News")
         for item in rss_anthropic[:6]:
             date_str = f" ({item['pubDate']})" if item.get("pubDate") else ""
             lines.append(f"- [{item.get('title', '')}]({item.get('link', '')}){date_str}")
+            if item.get("summary"):
+                lines.append(f"  {item['summary'][:200]}")
         lines.append("")
 
-    # Additional feeds for Claude to fetch
-    lines.append("## Diese RSS-Feeds musst du jetzt fetchen (via fetch_rss Tool):")
-    for name, url in RSS_FEEDS_FOR_SYNTHESIS:
-        lines.append(f"- {name}: {url}")
-    lines.append("")
+    # All pre-fetched RSS feeds from Python
+    for feed in rss_results:
+        name = feed["name"]
+        items = feed["items"]
+        if not items:
+            continue
+        lines.append(f"## {name}")
+        for item in items[:8]:
+            pub = item.get("published", "")
+            date_str = f" ({pub})" if pub else ""
+            title = item.get("title", "Ohne Titel")
+            link = item.get("link", "")
+            lines.append(f"- [{title}]({link}){date_str}")
+            summary = item.get("summary", "")
+            if summary:
+                lines.append(f"  {summary[:200]}")
+        lines.append("")
+
     lines.append(
-        "Fetche ALLE Feeds in der Liste oben. Dann filtere auf letzte 48h, "
-        "cluster gleiche Stories zu einem Eintrag, und gib das JSON-Array zurück."
+        "Alle Quellen sind oben aufgeführt. Filtere auf letzte 48h, "
+        "cluster gleiche Stories zu einem Eintrag, und gib das JSON-Array zurück. "
+        "Du musst KEINE Tools aufrufen – alle Daten liegen bereits vor."
     )
 
     return "\n".join(lines)
@@ -208,9 +243,9 @@ def _run_agentic_loop(
     client,
     system_prompt: str,
     user_message: str,
-    tools: list,
+    tools: list | None,
     max_iterations: int,
-    force_output_after: int,
+    force_output_after: int | None,
     phase_name: str,
     nudge_message: str,
 ) -> list:
@@ -222,7 +257,7 @@ def _run_agentic_loop(
     for iteration in range(1, max_iterations + 1):
         logger.info(f"[{phase_name}] Iteration {iteration}/{max_iterations}")
 
-        force_output = tool_call_count >= force_output_after
+        force_output = force_output_after is not None and tool_call_count >= force_output_after
 
         if force_output and not nudge_sent:
             logger.info(f"[{phase_name}] Forcing output after {tool_call_count} tool calls")
@@ -231,11 +266,11 @@ def _run_agentic_loop(
 
         create_kwargs = dict(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=8192,
             system=system_prompt,
             messages=messages,
         )
-        if not force_output:
+        if tools and not force_output:
             create_kwargs["tools"] = tools
 
         response = _create_with_retry(client, create_kwargs)
@@ -274,29 +309,31 @@ def _run_agentic_loop(
 
 
 def run_synthesis(client, input_data: dict) -> list:
-    """Phase 1: Fetch all RSS feeds, filter to 48h, deduplicate topics."""
-    synthesis_tools = [t for t in TOOL_DEFINITIONS if t["name"] == "fetch_rss"]
-    user_message = build_synthesis_message(input_data)
+    """Phase 1: Pre-fetch RSS in Python, then Claude filters + deduplicates."""
+    # Fetch all RSS feeds in parallel (Python, not Claude tool calls)
+    logger.info("=== Pre-fetching RSS feeds ===")
+    rss_results = prefetch_rss_feeds()
+    total_items = sum(len(f["items"]) for f in rss_results)
+    logger.info(f"Pre-fetched {len(rss_results)} feeds, {total_items} total items")
 
-    logger.info("=== Phase 1: Synthesis ===")
+    user_message = build_synthesis_message(input_data, rss_results)
+    logger.info(f"Synthesis message length: {len(user_message)} chars")
+
+    logger.info("=== Phase 1: Synthesis (no tool calls) ===")
     return _run_agentic_loop(
         client=client,
         system_prompt=SYNTHESIS_SYSTEM_PROMPT,
         user_message=user_message,
-        tools=synthesis_tools,
+        tools=None,  # No tools needed – all data already in message
         max_iterations=SYNTHESIS_MAX_ITERATIONS,
-        force_output_after=SYNTHESIS_FORCE_OUTPUT_AFTER,
+        force_output_after=None,
         phase_name="Synthesis",
-        nudge_message=(
-            "Du hast genug Feeds gefetcht. Erstelle jetzt die deduplizierte Topic-Liste "
-            "als JSON-Array. Nur das Array, kein Text drumherum."
-        ),
+        nudge_message="",
     )
 
 
 def run_idea_generation(client, topics: list) -> list:
     """Phase 2: Generate 10 LinkedIn ideas from deduplicated topics."""
-    # fetch_article and web_search – topics already fetched, no need for fetch_rss
     idea_tools = [t for t in TOOL_DEFINITIONS if t["name"] in ("fetch_article", "web_search")]
     user_message = build_ideas_message(topics)
 
@@ -320,7 +357,7 @@ def run_agent(input_data: dict) -> list:
     """Two-phase pipeline: synthesis → idea generation."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    # Phase 1: Collect, filter, deduplicate
+    # Phase 1: Pre-fetch RSS, filter 48h, deduplicate
     topics = run_synthesis(client, input_data)
 
     # Phase 2: Generate 10 ideas with autofyn angle

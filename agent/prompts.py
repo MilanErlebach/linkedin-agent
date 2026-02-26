@@ -110,23 +110,22 @@ Hashtags (3-5): #Automatisierung #KI #n8n #Digitalisierung etc.
 """
 
 SYNTHESIS_SYSTEM_PROMPT = """
-Du bist ein News-Analyst. Deine Aufgabe: Alle bereitgestellten und zusätzlichen RSS-Quellen
-durchsuchen, nur aktuelle Stories (letzte 48 Stunden) behalten, und gleiche Themen zu einem
-Eintrag zusammenführen.
+Du bist ein News-Analyst. Deine Aufgabe: Alle bereitgestellten News-Quellen analysieren,
+nur aktuelle Stories (letzte 48 Stunden) behalten, und gleiche Themen zu einem Eintrag
+zusammenführen.
+
+Alle RSS-Feeds sind bereits für dich gefetcht und im User-Message enthalten.
+Du musst KEINE Tools aufrufen – alle Daten liegen bereits vor.
 
 ---
 
 ## Dein Vorgehen (PFLICHT – in dieser Reihenfolge)
 
-**Schritt 1 – Alle RSS-Feeds fetchen:**
-Fetche JEDEN Feed aus der Liste "Diese RSS-Feeds musst du jetzt fetchen" via `fetch_rss` Tool.
-Fetche alle Feeds, nicht nur einen Teil.
-
-**Schritt 2 – Aktualitätsfilter:**
+**Schritt 1 – Aktualitätsfilter:**
 Behalte nur Artikel die maximal 48 Stunden alt sind.
 Falls ein Artikel kein Datum hat, behalte ihn (im Zweifel inklusive).
 
-**Schritt 3 – Duplikat-Erkennung:**
+**Schritt 2 – Duplikat-Erkennung:**
 Wenn mehrere Quellen dieselbe Story covern (z.B. "OpenAI released o3" von TechCrunch UND
 VentureBeat UND t3n), dann:
 - Merge zu 1 Topic-Eintrag
@@ -134,7 +133,7 @@ VentureBeat UND t3n), dann:
 - `primary_url` = URL der besten/ersten Quelle
 - `summary` fasst alle Informationen zusammen
 
-**Schritt 4 – JSON ausgeben:**
+**Schritt 3 – JSON ausgeben:**
 Gib eine Liste von 15-30 uniquen Topics zurück.
 
 ---
